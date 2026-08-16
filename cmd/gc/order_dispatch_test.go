@@ -1881,6 +1881,53 @@ func TestOrderDispatchCachesAutoTrackingBeadCreatedAt(t *testing.T) {
 	}
 }
 
+// TestOrderDispatchDoesNotReparseConfigPerTick is the ga-237xpr regression
+// test: dispatch()'s per-tick store-open must reuse the dispatcher's own
+// cached *config.City instead of re-parsing city.toml (and all pack
+// includes) on every tick for every scope target. Unlike the other dispatch
+// tests in this file, this one drives the REAL storeFn built by
+// newMemoryOrderDispatcher rather than buildOrderDispatcherFromListExec's
+// fixed-store stub, so the dispatcher's cached cfg actually reaches a store
+// open instead of stopping at a stub.
+//
+// Scope, stated exactly, because a test that overstates its coverage stops
+// the next reader from looking: this city declares provider = "file", so it
+// covers the dispatcher -> openStoreAtForCityWithConfig -> OpenFileStore
+// path and nothing else. It does NOT exercise the exec: or native bd store
+// paths. Per-provider coverage of the same config-reuse invariant lives in
+// store_rollout_test.go — TestOpenStoreResultWithConfigSkipsLoad for the
+// file path and TestOpenStoreResultWithConfigSkipsLoad_ExecProvider for the
+// exec: path, which is where the reparse hole actually was.
+func TestOrderDispatchDoesNotReparseConfigPerTick(t *testing.T) {
+	cityDir := t.TempDir()
+	toml := "[workspace]\nname = \"t\"\n\n[beads]\nprovider = \"file\"\n"
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadCityConfig(cityDir, io.Discard)
+	if err != nil {
+		t.Fatalf("loadCityConfig: %v", err)
+	}
+
+	aa := []orders.Order{{
+		Name:     "perf-test-order",
+		Trigger:  "cooldown",
+		Interval: "1h",
+		Exec:     "true",
+	}}
+	ad := newMemoryOrderDispatcher(nil, aa, cityDir, cfg, events.Discard, io.Discard)
+
+	before := loadCityConfigCalls.Load()
+	now := time.Now()
+	for i := 0; i < 10; i++ {
+		ad.dispatch(context.Background(), cityDir, now.Add(time.Duration(i)*time.Millisecond))
+	}
+	ad.drain(context.Background())
+	if grew := loadCityConfigCalls.Load() - before; grew != 0 {
+		t.Fatalf("dispatch() re-parsed city config %d times across 10 ticks; want 0 — every tick's store open must reuse the dispatcher's cached config instead of reloading city.toml from disk", grew)
+	}
+}
+
 // --- exec order dispatch tests ---
 
 func TestOrderDispatchExecDue(t *testing.T) {
@@ -10272,4 +10319,56 @@ func TestCountClosedOrderTrackingRetentionEligible(t *testing.T) {
 			t.Fatalf("count = %d, want 0 for empty store", count)
 		}
 	})
+}
+
+func TestOrderDispatchMaxDispatchesPerTickConfig(t *testing.T) {
+	aa := []orders.Order{{
+		Name:         "cap-order",
+		Trigger:      "cooldown",
+		Interval:     "1m",
+		Formula:      "test-formula",
+		Pool:         "worker",
+		FormulaLayer: sharedTestFormulaDir,
+	}}
+
+	// Unset (zero) preserves the historical default of 4.
+	cfgDefault := &config.City{}
+	adDefault := buildOrderDispatcherFromOrderSet(nil, t.TempDir(), cfgDefault, aa, events.Discard, &bytes.Buffer{})
+	mDefault, ok := adDefault.(*memoryOrderDispatcher)
+	if !ok {
+		t.Fatalf("expected *memoryOrderDispatcher, got %T", adDefault)
+	}
+	if mDefault.maxDispatchesPerTick != defaultMaxOrderDispatchesPerTick {
+		t.Errorf("default maxDispatchesPerTick = %d, want %d", mDefault.maxDispatchesPerTick, defaultMaxOrderDispatchesPerTick)
+	}
+
+	// Configured value of 1 overrides the default.
+	one := 1
+	cfgOne := &config.City{}
+	cfgOne.Orders.MaxDispatchesPerTick = &one
+	adOne := buildOrderDispatcherFromOrderSet(nil, t.TempDir(), cfgOne, aa, events.Discard, &bytes.Buffer{})
+	mOne, ok := adOne.(*memoryOrderDispatcher)
+	if !ok {
+		t.Fatalf("expected *memoryOrderDispatcher, got %T", adOne)
+	}
+	if mOne.maxDispatchesPerTick != 1 {
+		t.Errorf("configured maxDispatchesPerTick = %d, want 1", mOne.maxDispatchesPerTick)
+	}
+
+	// Zero or negative values fall back to the default rather than passing
+	// through: inside the dispatch loop a cap <= 0 means UNCAPPED, so honoring
+	// them would silently disable the cap entirely.
+	for _, bad := range []int{0, -3} {
+		v := bad
+		cfgBad := &config.City{}
+		cfgBad.Orders.MaxDispatchesPerTick = &v
+		adBad := buildOrderDispatcherFromOrderSet(nil, t.TempDir(), cfgBad, aa, events.Discard, &bytes.Buffer{})
+		mBad, ok := adBad.(*memoryOrderDispatcher)
+		if !ok {
+			t.Fatalf("expected *memoryOrderDispatcher, got %T", adBad)
+		}
+		if mBad.maxDispatchesPerTick != defaultMaxOrderDispatchesPerTick {
+			t.Errorf("maxDispatchesPerTick with configured %d = %d, want default %d", bad, mBad.maxDispatchesPerTick, defaultMaxOrderDispatchesPerTick)
+		}
+	}
 }

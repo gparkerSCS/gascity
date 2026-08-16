@@ -131,6 +131,17 @@ type CityRuntime struct {
 	orderRescanLast         time.Time
 	trace                   *sessionReconcilerTraceManager
 
+	// routeRecovery is the route-repair lane: an event-fed delta pass in the
+	// tick and a cadenced authoritative scan behind it. Created on first use so
+	// a directly-constructed runtime needs no wiring.
+	routeRecovery     *routeRecoveryLane
+	routeRecoveryOnce sync.Once
+
+	// completions is the graph.v2 completion-fact lane, the same delta/sweep
+	// split as routeRecovery.
+	completions     *completionsLane
+	completionsOnce sync.Once
+
 	orderSweepWatchdogLast             time.Time
 	orderTrackingRetentionWatchdogLast time.Time
 	nudgeMailSweepWatchdogLast         time.Time
@@ -203,9 +214,17 @@ type CityRuntime struct {
 
 	shutdownOnce             sync.Once
 	preserveSessionsShutdown atomic.Bool
-	forceStopShutdown        *atomic.Bool
-	logPrefix                string // "gc start" or "gc supervisor"
-	stdout, stderr           io.Writer
+	// ownedCity is set true once run() begins, i.e. once this runtime has
+	// passed every init-failure/discard point and is the process actually
+	// driving the city. It gates the shutdown-time server teardown: a
+	// discarded half-built runtime (e.g. adoption of an already-running
+	// city, or a controller-lock/socket/token failure) calls shutdown()
+	// without ever owning the city, and must not tear down the live city's
+	// shared server out from under it.
+	ownedCity         atomic.Bool
+	forceStopShutdown *atomic.Bool
+	logPrefix         string // "gc start" or "gc supervisor"
+	stdout, stderr    io.Writer
 }
 
 const runtimeDemandSnapshotMaxAge = 30 * time.Second
@@ -352,6 +371,11 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// NOTE: the routes are NOT registered as this city's residency answer here.
+	// Construction happens before the supervisor knows whether it can take the
+	// controller lock, and a replacement that loses it would have repointed the
+	// live city's release sweeps at a binding it is about to close. The lock
+	// holder registers — see registerResidencyRoutes.
 
 	sweepOrphanedOrderTrackingAtBoot(routes, p.CityPath, p.Cfg, p.Rec, p.Stderr)
 
@@ -451,6 +475,10 @@ func (cr *CityRuntime) crashTrack() crashTracker {
 // the per-city main loop — it watches config, reconciles agents, runs
 // wisp GC, and dispatches orders.
 func (cr *CityRuntime) run(ctx context.Context) {
+	// Reaching run() means every init-failure/discard point is behind us:
+	// this runtime is the live owner of the city, so its shutdown() is the
+	// one allowed to tear the provider's shared server down.
+	cr.ownedCity.Store(true)
 	defer cr.shutdown()
 
 	dirty := cr.configDirty
@@ -618,6 +646,17 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// post-restart rig re-enters pool demand without a manual `gc sling`
 	// (ga-n2d.4). Placed before the expensive reconcile for the same reason as
 	// startup-orders: routed demand should not wait behind cold-start drift work.
+	//
+	// The journal feed is armed FIRST, then the startup scan runs. The feed
+	// watches from the journal head at the moment it starts, so arming it before
+	// the scan makes the two overlap: everything older than the head is the
+	// scan's to repair and everything newer is the delta lane's. Arming it after
+	// would leave the scan's own duration as a hole no lane is watching. The
+	// overlap costs nothing — both passes are idempotent.
+	cr.startTickDeltaLanes(ctx, cr.routeRecoveryEventProvider())
+	// This is the lane's startup backstop, and it is the LAST full scan on the
+	// critical path: from here the tick sees only the event-fed delta pass, and
+	// the authoritative scan runs on cadence in the background lane.
 	startupRouteRecoveryStart := time.Now()
 	cr.safeTick(func() {
 		cr.recoverUnroutedWorkRoutes()
@@ -1174,10 +1213,24 @@ func (cr *CityRuntime) tick(
 	// Re-route ready work whose canonical pool route was lost or never written
 	// (gc.run_target set, gc.routed_to empty), so the autoscaler — which keys on
 	// gc.routed_to — sees it as demand without a manual `gc sling` (ga-n2d.4).
-	// Runs in the cheap dispatch phase before the expensive session reconcile.
+	//
+	// The tick runs the DELTA half only: the beads the event feed named since
+	// the last pass, and nothing else. A steady tick names nothing and reads no
+	// store at all. The authoritative full scan this replaced was 185.3s of a
+	// ~360s tick (ga-l7jdg) and now runs off-tick in the backstop lane.
 	phaseStart = time.Now()
-	cr.recoverUnroutedWorkRoutes()
-	recordPhase(TraceSiteControllerTickPhase, "recover_unrouted_work_routes", phaseStart, nil)
+	routeReport := cr.recoverUnroutedWorkRoutesDelta()
+	if trace != nil {
+		// The convergence lane runs on a background goroutine, so the tick's
+		// record is where its age becomes visible: `gc trace` answers "when did
+		// the backstop last converge, and why was it due" without an operator
+		// having to find the log line.
+		routeFields := routeReport.fields()
+		backstopAt, backstopReason, backstopRan := cr.routeRecoveryLaneOf().lastBackstop()
+		addBackstopAgeFields(routeFields, backstopAt, backstopReason, backstopRan)
+		trace.RecordControllerOperation(TraceSiteControllerTickPhase, TraceReasonRetained, routeReport.outcome(),
+			"recover_unrouted_work_routes", time.Since(phaseStart), routeFields)
+	}
 	if ctx.Err() != nil {
 		return
 	}
@@ -1330,13 +1383,28 @@ func (cr *CityRuntime) tick(
 		cr.beadReconcileTick(ctx, result, sessionBeads, trace, false)
 		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile_tick", phaseStart, traceDesiredStateFields(result))
 	}
-	// Graph stores intentionally do not emit bead.closed. Reconcile their
-	// closed graph.v2 steps only at the authoritative patrol cadence, not on
-	// event-driven ticks, so lifecycle recovery remains bounded and idempotent.
-	if trigger == "patrol" && cr.cs != nil {
+	// Graph stores intentionally do not emit bead.closed, so a step closed
+	// between the durable write and the best-effort journal append would be a
+	// permanent lifecycle gap. The tick repairs only the roots the journal named
+	// since the last pass; the whole-corpus convergence sweep runs off-tick in
+	// the background lane.
+	//
+	// The old gate here was `trigger == "patrol"`, which is not a cadence: under
+	// overload every surviving ticker fire IS a patrol trigger, so the full pass
+	// ran on every tick and cost 72.4s of it (ga-l7jdg).
+	if cr.cs != nil {
 		phaseStart = time.Now()
-		cr.cs.reconcileExecutionCompletions()
-		recordPhase(TraceSiteControllerTickPhase, "reconcile_execution_completions", phaseStart, nil)
+		completionsLane := cr.completionsLaneOf()
+		namedRoots := completionsLane.takePending()
+		emitted := cr.cs.reconcileExecutionCompletionsDelta(namedRoots)
+		completionFields := map[string]any{
+			"lane":        "delta",
+			"named_roots": len(namedRoots),
+			"emitted":     emitted,
+		}
+		sweptAt, sweptReason, swept := completionsLane.lastSweep()
+		addBackstopAgeFields(completionFields, sweptAt, sweptReason, swept)
+		recordPhase(TraceSiteControllerTickPhase, "reconcile_execution_completions", phaseStart, completionFields)
 	}
 
 	// Wisp GC: purge expired closed molecules. The molecule/wisp/workflow purge
@@ -2370,6 +2438,11 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		emitDeadAssigneeReopenedEvents(cr.rec, assignedWorkBeads, released, time.Now())
 		assignedWorkBeads, assignedWorkStoreRefs = filterReleasedAssignedWorkSnapshot(assignedWorkBeads, assignedWorkStoreRefs, released)
 	}
+	phaseStart = time.Now()
+	detachedRestored := sweepDetachedHandoffOrphansAcrossStores(store, rigStores, cr.logPrefix, cr.stderr)
+	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.sweep_detached_handoff_orphans", phaseStart, map[string]any{
+		"restored_count": detachedRestored,
+	})
 	// Squatter guard (gastownhall/gascity#2930): a foreign Dolt that has bound
 	// this city's managed port returns zero demand, indistinguishable from a
 	// genuinely-idle fleet — and would drain every running pool. This runs on
@@ -2434,6 +2507,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	} else {
 		phaseStart = time.Now()
 		if sweepUndesiredPoolSessionBeads(
+			cr.cityPath,
 			sessStore,
 			rigStores,
 			sessionBeads,
@@ -2474,7 +2548,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	cr.recordReconcileTraceInputs(trace, openInfos, desiredState, poolDesired, workSet, traceWorkRequested, readyWaitSet, result, recordPhase)
 
 	phaseStart = time.Now()
-	awakeAssignedWorkBeads, awakeAssignedStoreRefs := filterAssignedWorkBeadsForSessionWake(cr.cfg, cr.cityPath, openInfos, assignedWorkBeads, assignedWorkStoreRefs)
+	awakeAssignedWorkBeads, awakeAssignedStoreRefs := filterAssignedWorkBeadsForSessionWake(cr.cfg, cr.cityPath, store, openInfos, assignedWorkBeads, assignedWorkStoreRefs)
 	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.filter_assigned_work_for_wake", phaseStart, map[string]any{
 		"assigned_work_bead_count":       len(assignedWorkBeads),
 		"awake_assigned_work_bead_count": len(awakeAssignedWorkBeads),
@@ -2586,6 +2660,27 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 				result.SessionQueryPartial ||
 				result.ContinuationClaimQueryPartial,
 			time.Now(),
+			cr.stdout,
+		)
+		// The claim-without-execution lane. Both backstops above end at the
+		// claim; this one starts there. It reads the UNFILTERED assigned-work
+		// triple, which is the only index-aligned (bead, store, ref) view in the
+		// tick — the release filter above rewrites beads and refs but not stores
+		// — and re-checks ownership against each session's own identities anyway,
+		// so a released bead (whose assignee resolves to no live session by
+		// construction) cannot match a running one.
+		nudgeStalledPoolExecution(
+			cr.sp,
+			cr.cfg,
+			sessStore,
+			stalledPoolBeads,
+			result.AssignedWorkBeads,
+			result.AssignedWorkStores,
+			result.AssignedWorkStoreRefs,
+			result.StoreQueryPartial || result.SessionQueryPartial,
+			time.Now(),
+			cr.rec,
+			cr.requestExecutionStalledDrain,
 			cr.stdout,
 		)
 	}
@@ -2917,6 +3012,7 @@ func poolSweepWouldDrain(sessionBeads *sessionBeadSnapshot, desiredState map[str
 }
 
 func sweepUndesiredPoolSessionBeads(
+	cityPath string,
 	store beads.SessionStore,
 	rigStores map[string]beads.Store,
 	sessionBeads *sessionBeadSnapshot,
@@ -3025,7 +3121,7 @@ func sweepUndesiredPoolSessionBeads(
 		// front door.
 		candidates = append(candidates, info)
 	}
-	return len(GCSweepSessionBeads(store.Store, rigStores, candidates))
+	return len(GCSweepSessionBeads(cityPath, store.Store, rigStores, candidates))
 }
 
 func poolSessionBeadRuntimeRunning(bead beads.Bead, sp runtime.Provider, processNames []string) (bool, error) {
@@ -3528,11 +3624,31 @@ func (cr *CityRuntime) demandSnapshotPatrolMaxAge() time.Duration {
 	return scaleCheckDemandMinInterval
 }
 
+// readyDemandSnapshotFingerprint hashes the ready sets of every store the
+// demand probe reads, so a write anywhere in that set invalidates the cached
+// demand snapshot instead of letting it be reused for up to its max age.
+//
+// "Every store the probe reads" is the load-bearing part. The fingerprint hashed
+// the work store and the rigs; the probe's LEADING leg is the sessions-class
+// store, which on a converged split city is the graph binding — the store that
+// holds every routed graph step. So a step claimed or closed in the binding
+// changed nothing the fingerprint could see, and the controller went on
+// asserting demand for it for the rest of the snapshot window: phantom demand,
+// spawning seats for work that was already taken.
 func (cr *CityRuntime) readyDemandSnapshotFingerprint() string {
 	stores := []struct {
 		ref   string
 		store beads.Store
 	}{{ref: cr.cityName, store: cr.cityBeadStore()}}
+	// The demand probe's leading leg. Deduped by store identity: on a city that
+	// relocates nothing this IS the work store already hashed above, and hashing
+	// it twice would only double the read.
+	if sessions := cr.sessionsBeadStore().Store; !sameFingerprintStore(sessions, stores[0].store) {
+		stores = append(stores, struct {
+			ref   string
+			store beads.Store
+		}{ref: "class:sessions", store: sessions})
+	}
 	rigStores := cr.rigBeadStores()
 	refs := make([]string, 0, len(rigStores))
 	for ref := range rigStores {
@@ -3571,6 +3687,21 @@ func (cr *CityRuntime) readyDemandSnapshotFingerprint() string {
 		}
 	}
 	return fmt.Sprintf("%x", h.Sum64())
+}
+
+// sameFingerprintStore reports whether two store handles are the same underlying
+// store, so the demand fingerprint reads each distinct store exactly once. It is
+// pointer identity — the same question workAssignmentStoresHave asks — because a
+// city that relocates nothing serves several coordination classes from one store
+// value, and a city that relocates them serves the sessions class from a
+// genuinely different one.
+func sameFingerprintStore(a, b beads.Store) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	aKey, aOK := storePointerKey(a)
+	bKey, bOK := storePointerKey(b)
+	return aOK && bOK && aKey == bKey
 }
 
 func writeReadyDemandFingerprintBead(w io.Writer, bead beads.Bead) {
@@ -3785,6 +3916,12 @@ func (cr *CityRuntime) shutdown() {
 		// process that exits holding it leaves the successor's open racing this
 		// one's.
 		defer func() {
+			// Stop naming these routes before closing them: a sweep that
+			// resolved its bindings from a closed handle would answer every leg
+			// with an error instead of falling back to the one-shot funnel.
+			// Passing our OWN routes is what keeps this from dropping a
+			// registration a live replacement already installed.
+			unregisterResidencyRoutes(cr.cityPath, cr.storageRoutes)
 			if err := cr.storageRoutes.close(); err != nil {
 				fmt.Fprintf(cr.stderr, "%s: closing the storage binding: %v\n", cr.logPrefix, err) //nolint:errcheck // best-effort stderr
 			}
@@ -3838,12 +3975,21 @@ func (cr *CityRuntime) shutdown() {
 				fmt.Fprintf(cr.stderr, "%s: shutdown session listing failed: %v\n", cr.logPrefix, listErr) //nolint:errcheck // best-effort stderr
 			}
 		}
+		// sweepEnumerated tracks whether every stop pass this shutdown ran
+		// actually listed the fleet. A failed ListRunning yields an empty
+		// slice, so gracefulStopAll stops nothing — tearing the server down
+		// after that would turn a transient listing error into an ungraceful
+		// mass kill of sessions we never enumerated. Partial failures count
+		// as not-enumerated too: we did not see the whole fleet, so we must
+		// not kill-server on the strength of a subset.
+		sweepEnumerated := listErr == nil
 		store := cr.sessionsBeadStore()
 		markCityStopSessionSleepReason(sessionFrontDoor(store.Store), cr.stderr)
 		gracefulStopAllWithForceSignal(running, cr.sp, gracefulTimeout, cr.rec, cr.cfg, store, cr.stdout, cr.stderr, cr.forceStopRequested)
 		if !asyncStartsDrained && cr.forceStopRequested() {
 			lateRunning, lateListErr := cr.sp.ListRunning("")
 			if lateListErr != nil {
+				sweepEnumerated = false
 				if runtime.IsPartialListError(lateListErr) {
 					fmt.Fprintf(cr.stderr, "%s: force shutdown late async-start listing partially failed; stopping %d visible agent(s): %v\n", cr.logPrefix, len(lateRunning), lateListErr) //nolint:errcheck // best-effort stderr
 				} else {
@@ -3854,6 +4000,23 @@ func (cr *CityRuntime) shutdown() {
 				markCityStopSessionSleepReason(sessionFrontDoor(store.Store), cr.stderr)
 				gracefulStopAllWithForceSignal(lateRunning, cr.sp, 0, cr.rec, cr.cfg, store, cr.stdout, cr.stderr, cr.forceStopRequested)
 			}
+		}
+		// With every enumerated session stopped, tear down the provider's
+		// shared server, exactly like the standalone stop path (cmdStopBody
+		// -> teardownServerForStop). Without this, a supervisor-managed stop
+		// leaks the city's tmux server until someone kills it by hand
+		// (#5175). Two guards keep the kill-server narrow:
+		//   - ownedCity: only a runtime that reached run() owns this city.
+		//     A discarded half-built runtime (adoption of an already-running
+		//     city; a controller-lock/socket/token failure) calls shutdown()
+		//     too, and must never kill the live owner's server.
+		//   - sweepEnumerated: only tear down after a stop that actually
+		//     listed the fleet, never on the empty slice a failed list leaves.
+		// The preserve-sessions shutdown returned above, before the session
+		// stops — preserved sessions live inside this server, so keeping it
+		// up there is by design, not an omission.
+		if cr.ownedCity.Load() && sweepEnumerated {
+			teardownServerForStop(cr.sp, cr.stderr, fmt.Sprintf("%s: city '%s'", cr.logPrefix, cr.cityName))
 		}
 	})
 }

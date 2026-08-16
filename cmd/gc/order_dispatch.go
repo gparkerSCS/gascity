@@ -440,11 +440,20 @@ func newMemoryOrderDispatcher(routes *storageRoutes, aa []orders.Order, cityPath
 		ep = p
 	}
 
+	maxDispatchesPerTick := defaultMaxOrderDispatchesPerTick
+	if cfg.Orders.MaxDispatchesPerTick != nil && *cfg.Orders.MaxDispatchesPerTick > 0 {
+		maxDispatchesPerTick = *cfg.Orders.MaxDispatchesPerTick
+	}
+
 	dispatchCtx, dispatchCancel := context.WithCancel(context.Background())
 	return &memoryOrderDispatcher{
 		aa: aa,
 		storeFn: func(target execStoreTarget) (beads.Store, error) {
-			return openStoreAtForCity(target.ScopeRoot, cityPath)
+			// Reuse cfg (rebuilt only on config reload/rescan — see
+			// CityRuntime.replaceOrderDispatcher) instead of re-parsing
+			// city.toml and all pack includes on every dispatch tick for
+			// every scope target (ga-237xpr).
+			return openStoreAtForCityWithConfig(target.ScopeRoot, cityPath, cfg)
 		},
 		storageRoutes:        routes,
 		ep:                   ep,
@@ -452,7 +461,7 @@ func newMemoryOrderDispatcher(routes *storageRoutes, aa []orders.Order, cityPath
 		rec:                  rec,
 		stderr:               lockedStderr(stderr),
 		maxTimeout:           cfg.Orders.MaxTimeoutDuration(),
-		maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick,
+		maxDispatchesPerTick: maxDispatchesPerTick,
 		cfg:                  cfg,
 		cityName:             loadedCityName(cfg, cityPath),
 		cityPath:             cityPath,
